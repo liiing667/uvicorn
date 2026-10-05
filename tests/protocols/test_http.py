@@ -717,6 +717,59 @@ async def test_early_response(http_protocol_cls: type[HTTPProtocol]):
     assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
 
 
+async def test_early_hints(http_protocol_cls: type[HTTPProtocol]):
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
+        assert scope["type"] == "http"
+        assert "http.response.early_hint" in scope["extensions"]
+        await send(
+            {
+                "type": "http.response.early_hint",
+                "links": [b"</style.css>; rel=preload; as=style", b"</script.js>; rel=preload; as=script"],
+            }
+        )
+        await send({"type": "http.response.early_hint", "links": [b"</font.woff2>; rel=preload; as=font"]})
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"OK"})
+
+    protocol = get_connected_protocol(app, http_protocol_cls)
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    await protocol.loop.run_one()
+    buffer = protocol.transport.buffer
+    assert buffer.count(b"HTTP/1.1 103") == 2
+    assert b"link: </style.css>; rel=preload; as=style\r\n" in buffer
+    assert b"link: </script.js>; rel=preload; as=script\r\n" in buffer
+    assert b"link: </font.woff2>; rel=preload; as=font\r\n" in buffer
+    assert buffer.index(b"HTTP/1.1 103") < buffer.index(b"HTTP/1.1 200 OK")
+
+
+async def test_early_hints_not_sent_to_http10_client(http_protocol_cls: type[HTTPProtocol]):
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
+        assert scope["type"] == "http"
+        assert "http.response.early_hint" not in scope.get("extensions", {})
+        await send({"type": "http.response.early_hint", "links": [b"</style.css>; rel=preload; as=style"]})
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"OK"})
+
+    protocol = get_connected_protocol(app, http_protocol_cls)
+    protocol.data_received(HTTP10_GET_REQUEST)
+    await protocol.loop.run_one()
+    assert b"HTTP/1.1 103" not in protocol.transport.buffer
+    assert b"link:" not in protocol.transport.buffer
+    assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
+
+
+async def test_early_hint_after_response_start(http_protocol_cls: type[HTTPProtocol]):
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.early_hint", "links": [b"</style.css>; rel=preload; as=style"]})
+
+    protocol = get_connected_protocol(app, http_protocol_cls)
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    await protocol.loop.run_one()
+    assert b"HTTP/1.1 103" not in protocol.transport.buffer
+    assert protocol.transport.is_closing()
+
+
 async def test_read_after_response(http_protocol_cls: type[HTTPProtocol]):
     message_after_response = None
 

@@ -219,6 +219,10 @@ class H11Protocol(asyncio.Protocol):
                     "headers": self.headers,
                     "state": self.app_state.copy(),
                 }
+                # RFC 7231 forbids sending 1xx responses to HTTP/1.0 clients,
+                # so the extension is advertised for HTTP/1.1 requests only.
+                if event.http_version == b"1.1":
+                    self.scope["extensions"] = {"http.response.early_hint": {}}
                 if self._should_upgrade():
                     self.handle_websocket_upgrade(event)
                     return
@@ -455,10 +459,26 @@ class RequestResponseCycle:
         if self.disconnected:
             return  # pragma: full coverage
 
+        if message["type"] == "http.response.early_hint" and not self.response_started:
+            # RFC 8297: one or more 103 responses may precede the final
+            # response, but only to clients that declared support through
+            # HTTP/1.1. Each value in "links" becomes a Link header.
+            if self.scope["http_version"] == "1.1":
+                headers = [(b"link", link) for link in message["links"]]
+                event = h11.InformationalResponse(
+                    status_code=103, headers=headers, reason=STATUS_PHRASES[103]
+                )
+                output = self.conn.send(event=event)
+                self.transport.write(output)
+            return
+
         if not self.response_started:
             # Sending response status line and headers
             if message["type"] != "http.response.start":
-                raise RuntimeError(f"Expected ASGI message 'http.response.start', but got '{message['type']}'.")
+                raise RuntimeError(
+                    "Expected ASGI message 'http.response.start' or 'http.response.early_hint', "
+                    f"but got '{message['type']}'."
+                )
 
             self.response_started = True
             self.waiting_for_100_continue = False

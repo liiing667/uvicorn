@@ -250,6 +250,10 @@ class HttpToolsProtocol(asyncio.Protocol):
         self.scope["method"] = method.decode("ascii")
         if http_version != "1.1":
             self.scope["http_version"] = http_version
+        else:
+            # RFC 7231 forbids sending 1xx responses to HTTP/1.0 clients,
+            # so the extension is advertised for HTTP/1.1 requests only.
+            self.scope["extensions"] = {"http.response.early_hint": {}}
         if self.parser.should_upgrade() and self._should_upgrade():
             return
         parsed_url = httptools.parse_url(self.url)
@@ -463,10 +467,25 @@ class RequestResponseCycle:
         if self.disconnected:
             return  # pragma: full coverage
 
+        if message["type"] == "http.response.early_hint" and not self.response_started:
+            # RFC 8297: one or more 103 responses may precede the final
+            # response, but only to clients that declared support through
+            # HTTP/1.1. Each value in "links" becomes a Link header.
+            if self.scope["http_version"] == "1.1":
+                content = [STATUS_LINE[103]]
+                for link in message["links"]:
+                    content.extend([b"link: ", link, b"\r\n"])
+                content.append(b"\r\n")
+                self.transport.write(b"".join(content))
+            return
+
         if not self.response_started:
             # Sending response status line and headers
             if message["type"] != "http.response.start":
-                raise RuntimeError(f"Expected ASGI message 'http.response.start', but got '{message['type']}'.")
+                raise RuntimeError(
+                    "Expected ASGI message 'http.response.start' or 'http.response.early_hint', "
+                    f"but got '{message['type']}'."
+                )
 
             self.response_started = True
             self.waiting_for_100_continue = False
